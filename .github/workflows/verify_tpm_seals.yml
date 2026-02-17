@@ -1,69 +1,98 @@
-name: Verify TPM Seals
+name: Verify TPM Public Seals
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
 
 jobs:
-  verify-seals:
-    runs-on: windows-latest
+  verify:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Verify TPM Seal Integrity
-        shell: pwsh
+      - name: Check for public seal artifacts
         run: |
-          Write-Host "=== LAYER 1: TPM Seal Verification ==="
-          $sealPath = "C:\ProgramData\OpsAgent\Seals"
-          $logPath = "C:\ProgramData\OpsAgent\Logs\opsagent_runlog.jsonl"
-          
-          # Verify seal files exist and are signed
-          if (Test-Path $sealPath) {
-            $seals = Get-ChildItem $sealPath -Filter "*.seal"
-            foreach ($seal in $seals) {
-              $hash = Get-FileHash $seal.FullName -Algorithm SHA256
-              Write-Host "SEAL: $($seal.Name) | SHA256: $($hash.Hash)"
-            }
-            Write-Host "TPM Seal Count: $($seals.Count)"
-          } else {
-            Write-Host "::warning::Seal directory not found - first run expected"
-          }
-          
-          Write-Host ""
-          Write-Host "=== LAYER 2: Chain Log Integrity ==="
-          if (Test-Path $logPath) {
-            $entries = Get-Content $logPath | ForEach-Object { $_ | ConvertFrom-Json }
-            $lastEntry = $entries[-1]
-            Write-Host "Last Entry Timestamp: $($lastEntry.timestamp)"
-            Write-Host "Last Entry Type: $($lastEntry.event_type)"
-            Write-Host "Chain Length: $($entries.Count) entries"
-            
-            # Verify chain continuity
-            $broken = $false
-            for ($i = 1; $i -lt $entries.Count; $i++) {
-              if ($entries[$i].prev_hash -ne $entries[$i-1].current_hash) {
-                Write-Host "::error::Chain break detected at entry $i"
-                $broken = $true
-              }
-            }
-            if (-not $broken) {
-              Write-Host "Chain integrity: VERIFIED"
-            }
-          } else {
-            Write-Host "::warning::Log file not found - first run expected"
-          }
-          
-          Write-Host ""
-          Write-Host "=== LAYER 3: Git Commit Signature Verification ==="
-          git log --show-signature -1
-          
-          Write-Host ""
-          Write-Host "=== VERIFICATION COMPLETE ==="
-          Write-Host "Three independent validation layers checked."
-          Write-Host "Status: ENFORCED"
+          echo "=== LAYER 1: Public Seal Artifact Check ==="
+          shopt -s nullglob
+          seals=(*_seal_public.json)
+          if [ ${#seals[@]} -eq 0 ]; then
+            echo "::warning::No public seal artifacts found yet (first run expected)"
+            echo "Repo contains only workflow + README at this stage."
+            echo "Public seals will appear after local OpsAgent seal + anchor sync."
+            exit 0
+          fi
+          echo "Found ${#seals[@]} public seal artifact(s)"
+          for f in "${seals[@]}"; do
+            echo "  - $f"
+          done
+
+      - name: Convert public cert to PEM (if present)
+        run: |
+          echo "=== LAYER 2: Certificate Verification ==="
+          if [ -f tpm_anchor_public.cer ]; then
+            openssl x509 -inform DER -in tpm_anchor_public.cer -out tpm_anchor_public.pem
+            echo "TPM anchor cert converted to PEM"
+            openssl x509 -in tpm_anchor_public.pem -noout -fingerprint -sha256
+          else
+            echo "::warning::TPM anchor cert not yet published (expected after first seal push)"
+          fi
+
+      - name: Verify public seals (signature + signer match)
+        run: |
+          echo "=== LAYER 3: Cryptographic Seal Verification ==="
+          shopt -s nullglob
+          seals=(*_seal_public.json)
+          if [ ${#seals[@]} -eq 0 ]; then
+            echo "No seals to verify yet - skipping."
+            exit 0
+          fi
+
+          ok=1
+          for j in "${seals[@]}"; do
+            s="${j%.json}.p7s"
+            if [ ! -f "$s" ]; then
+              echo "FAIL: Missing signature for $j (expected $s)"
+              ok=0
+              continue
+            fi
+
+            openssl cms -verify -binary -inform DER -in "$s" -content "$j" -noverify >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              echo "FAIL: signature invalid for $j"
+              ok=0
+              continue
+            fi
+
+            if [ -f tpm_anchor_public.pem ]; then
+              openssl pkcs7 -inform DER -in "$s" -print_certs -out signer.pem 2>/dev/null
+              anchor_fp=$(openssl x509 -in tpm_anchor_public.pem -noout -fingerprint -sha256 | sed 's/^.*=//')
+              signer_fp=$(openssl x509 -in signer.pem -noout -fingerprint -sha256 | sed 's/^.*=//')
+
+              if [ "$anchor_fp" != "$signer_fp" ]; then
+                echo "FAIL: signer mismatch for $j"
+                echo " anchor=$anchor_fp"
+                echo " signer=$signer_fp"
+                ok=0
+              else
+                echo "OK: $j verified (signature + signer match)"
+              fi
+            else
+              echo "OK: $j signature valid (cert not yet available for fingerprint match)"
+            fi
+          done
+
+          if [ $ok -ne 1 ]; then
+            echo "::error::One or more seal verifications FAILED"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== VERIFICATION COMPLETE ==="
+          echo "All public seals verified."
+          echo "Three independent validation layers checked."
+          echo "Status: ENFORCED"
